@@ -56,6 +56,9 @@ class BinauralConfig:
     speed_of_sound: float = 343.0
     near_field_boost_db: float = 2.5
     normalize_peak: float = 0.97
+    # optional HRTFData from binaural360.hrtf; when set it replaces the
+    # parametric head model with measured HRIRs.
+    hrtf: object | None = None
 
 
 def _resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
@@ -78,9 +81,18 @@ def _woodworth_itd(alpha: float, a: float, c: float) -> float:
     return (a / c) * ((np.pi - alpha) + np.sin(alpha))
 
 
+def _dist_response(freqs: np.ndarray, dist: float, cfg: BinauralConfig) -> np.ndarray:
+    """Distance gain + near-field proximity low shelf (shared by both models)."""
+    dist_gain = 0.6 / max(dist, 0.2)
+    prox = float(np.clip((0.6 - dist) / 0.6, 0.0, 1.0))
+    db = cfg.near_field_boost_db * prox
+    bass = 1.0 + (10 ** (db / 20.0) - 1.0) / (1.0 + (freqs / 300.0) ** 2)
+    return dist_gain * bass
+
+
 def _binaural_transfer(freqs: np.ndarray, theta: float, phi: float,
                        dist: float, cfg: BinauralConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Complex L/R transfer functions for one source direction."""
+    """Parametric complex L/R transfer functions for one source direction."""
     a, c = cfg.head_radius_m, cfg.speed_of_sound
     alpha = abs(theta)
 
@@ -100,13 +112,7 @@ def _binaural_transfer(freqs: np.ndarray, theta: float, phi: float,
     if alpha > np.pi / 2:                        # rear: extra HF roll-off
         notch = notch / np.sqrt(1.0 + (freqs / 7000.0) ** 2)
 
-    # distance + near-field proximity low shelf
-    dist_gain = 0.6 / max(dist, 0.2)
-    prox = float(np.clip((0.6 - dist) / 0.6, 0.0, 1.0))
-    db = cfg.near_field_boost_db * prox
-    bass = 1.0 + (10 ** (db / 20.0) - 1.0) / (1.0 + (freqs / 300.0) ** 2)
-
-    common = notch * bass * dist_gain
+    common = notch * _dist_response(freqs, dist, cfg)
 
     if theta >= 0:                                # source on the right
         d_r, d_l = 0.0, itd
@@ -120,6 +126,17 @@ def _binaural_transfer(freqs: np.ndarray, theta: float, phi: float,
     hl = common * g_l * sh_l * np.exp(-2j * np.pi * freqs * d_l)
     hr = common * g_r * sh_r * np.exp(-2j * np.pi * freqs * d_r)
     return hl, hr
+
+
+def _measured_transfer(freqs: np.ndarray, hrtf, theta_deg: float, phi_deg: float,
+                       dist: float, cfg: BinauralConfig,
+                       n_fft: int) -> tuple[np.ndarray, np.ndarray]:
+    """Complex L/R transfer functions from measured HRIRs at one direction."""
+    h_l, h_r = hrtf.hrir(theta_deg, phi_deg)
+    hl = np.fft.rfft(h_l, n=n_fft)
+    hr = np.fft.rfft(h_r, n=n_fft)
+    common = _dist_response(freqs, dist, cfg)
+    return hl * common, hr * common
 
 
 def _make_room_ir(sr: int, preset: str, seed: int) -> np.ndarray | None:
@@ -174,6 +191,13 @@ def render_binaural(audio: np.ndarray, cfg: BinauralConfig | None = None,
         return np.zeros((0, 2), dtype=np.float32)
 
     n_fft = cfg.n_fft
+    hrtf = cfg.hrtf
+    if hrtf is not None:
+        if int(getattr(hrtf, "sr", sr)) != sr:
+            hrtf = hrtf.resampled(sr)
+        taps = int(getattr(hrtf, "taps", 0))
+        if taps and n_fft < taps:
+            n_fft = 1 << int(np.ceil(np.log2(taps)))
     hop = max(1, n_fft // cfg.hop_ratio)
     noverlap = n_fft - hop
 
@@ -184,13 +208,18 @@ def render_binaural(audio: np.ndarray, cfg: BinauralConfig | None = None,
         az = cfg.start_azimuth_deg + cfg.orbit_direction * 360.0 * (times / cfg.rotate_period_s)
     else:
         az = np.full_like(times, cfg.start_azimuth_deg)
-    theta = np.deg2rad(((az + 180.0) % 360.0) - 180.0)
+    az_deg = ((az + 180.0) % 360.0) - 180.0
+    theta = np.deg2rad(az_deg)
     phi = np.deg2rad(cfg.elevation_deg)
 
     yl = np.empty_like(z)
     yr = np.empty_like(z)
     for i in range(z.shape[1]):
-        hl, hr = _binaural_transfer(freqs, float(theta[i]), phi, cfg.distance_m, cfg)
+        if hrtf is not None:
+            hl, hr = _measured_transfer(freqs, hrtf, float(az_deg[i]),
+                                        cfg.elevation_deg, cfg.distance_m, cfg, n_fft)
+        else:
+            hl, hr = _binaural_transfer(freqs, float(theta[i]), phi, cfg.distance_m, cfg)
         yl[:, i] = z[:, i] * hl
         yr[:, i] = z[:, i] * hr
 
